@@ -1,22 +1,29 @@
-# Semantic Faithfullness of Language Models
+# Usage instructions
 
-Implementation of Intervention Based Training for conversational question answering (CoQA dataset) on BERT, RoBERTa and XLNet.
+1) Copy the dataset and place in ./data, files can be downloaded from 
 
-## Features
-1) Train on the original dataset
-2) Train on the combined O, TS, TS-R dataset
-3) Evaluation on O,TS, TS-R
+2) Run main.py with
+```
+python main.py --train [O|C] --eval [O|TS|RG] --output [directory]
+```
 
-## Usage
-#### Clone this repository
-#### Install the necessary requirements in the environment.yml file
-We recommend anaconda for this.
+--train O for original training
+--train C for combined training
+--eval O for eval on original dataset
+--eval TS for eval on TS dataset
+--eval RG for eval on TS-R dataset
+--output is the ouput directory for saving/loading weights and saving predictions and logs
+e.g.
 
 ```
-conda env create -f environment.yml
-conda activate RobustProject
+python main.py --train O --eval O --output bert_orig 	#(original training and eval on O)
+python main.py --eval TS --output bert_orig 		#(evaluate the model at bert_orig on TS dataset)
+python main.py --train C --eval O --output bert_orig 	#(combined training and eval on O)
 ```
-#### Download the datasets.
-Datasets for negation intervention and predicate argument structure experiments is available [here](https://drive.google.com/drive/u/0/folders/1gHHPyjgkhgVNlVwQ16bA54_wt6eM_bfH).
 
-#### Follow the instructions in the corresponding folder
+3) Following eval you will have a predictions.json file at the provided directory. Then run
+```
+python evaluate-v1.0.py --data-file data/coqa-dev-v1.0.json --pred-file [directory]/predictions.json
+```
+
+4) Steps 2, 3 needs to be repeated for original and combined training and evaluation on all datasets.
