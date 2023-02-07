@@ -16,9 +16,9 @@ python main.py --train [O|C] --eval [O|TS|RG] --output [directory]
 e.g.
 
 ```
-python main.py --train O --eval O --output bert_orig 	#(original training and eval on O)
-python main.py --eval TS --output bert_orig 		#(evaluate the model at bert_orig on TS dataset)
-python main.py --train C --eval O --output bert_orig 	#(combined training and eval on O)
+python main.py --train O --eval O --output Roberta_orig 	#(original training and eval on O)
+python main.py --eval TS --output Roberta_orig 			#(evaluate the model at Roberta_orig on TS dataset)
+python main.py --train C --eval O --output Roberta_orig 	#(combined training and eval on O)
 ```
 
 3) Following eval you will have a predictions.json file at the provided directory. Then run

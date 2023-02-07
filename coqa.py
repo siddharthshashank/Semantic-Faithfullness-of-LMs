@@ -140,16 +140,13 @@ class Processor(DataProcessor):
 
     def process(self, parsed_text):
         output = {'word': [], 'offsets': [], 'sentences': []}
-
         for token in parsed_text:
             output['word'].append(self._str(token.text))
             output['offsets'].append((token.idx, token.idx + len(token.text)))
-
         word_idx = 0
         for sent in parsed_text.sents:
             output['sentences'].append((word_idx, word_idx + len(sent)))
             word_idx += len(sent)
-
         assert word_idx == len(output['word'])
         return output
 
@@ -164,7 +161,6 @@ class Processor(DataProcessor):
 
             raw_context_offsets.append((p, p + len(token)))
             p += len(token)
-
         return raw_context_offsets
 
     def find_span(self, offsets, start, end):
@@ -181,11 +177,14 @@ class Processor(DataProcessor):
         def remove_articles(text):
             regex = re.compile(r'\b(a|an|the)\b', re.UNICODE)
             return re.sub(regex, ' ', text)
+
         def white_space_fix(text):
             return ' '.join(text.split())
+
         def remove_punc(text):
             exclude = set(string.punctuation)
             return ''.join(ch for ch in text if ch not in exclude)
+
         def lower(text):
             return text.lower()
         return white_space_fix(remove_articles(remove_punc(lower(s))))
@@ -194,6 +193,7 @@ class Processor(DataProcessor):
         best_f1 = 0.0
         best_span = (len(offsets) - 1, len(offsets) - 1)
         gt = self.normalize_answer(self.pre_proc(ground_truth)).split()
+
         ls = [
             i for i in range(len(offsets))
             if context[offsets[i][0]:offsets[i][1]].lower() in gt
@@ -230,7 +230,6 @@ class Processor(DataProcessor):
             return doc_tok
 
     def get_examples(self, data_dir, history_len, filename=None, threads=1,dataset_type = None, attention = False):
-        """ Returns the training examples from the data directory. """
         if data_dir is None:
             data_dir = ""
 
@@ -309,6 +308,7 @@ class Processor(DataProcessor):
                 end -= 1
             r_start, r_end = self.find_span(_datum['raw_context_offsets'], start, end)
             input_text = _qas['answer'].strip().lower()
+
             if input_text in chosen_text:
                 p = chosen_text.find(input_text)
                 _qas['answer_span'] = self.find_span(_datum['raw_context_offsets'], start + p, start + p + len(input_text))
@@ -325,9 +325,9 @@ class Processor(DataProcessor):
                 if j < 0:
                     continue
 
-                long_question += ' ' + datum['questions'][j]['input_text']
+                long_question += '|Q| ' + datum['questions'][j]['input_text']
                 if j < i:
-                    long_question += ' ' + datum['answers'][j]['input_text'] + ' '
+                    long_question += '|A| ' + datum['answers'][j]['input_text'] + ' '
 
                 long_question = long_question.strip()
                 long_questions.append(long_question)
@@ -373,7 +373,9 @@ class Processor(DataProcessor):
                 additional_answers=_qas['additional_answers'] if 'additional_answers' in _qas else None,
             )
             examples.append(example)
+
         return examples
+
 
 def Extract_Feature_init(tokenizer_for_convert):
     global tokenizer
@@ -407,7 +409,6 @@ def Extract_Feature(example, tokenizer, max_seq_length = 512, doc_stride = 128, 
             tok_to_orig_index.append(i)
             all_doc_tokens.append(sub_token)
 
-
     tok_r_start_position = orig_to_tok_index[example.rational_start_position]
     if example.rational_end_position < len(example.doc_tokens) - 1:
         tok_r_end_position = orig_to_tok_index[example.rational_end_position + 1] - 1
@@ -425,9 +426,8 @@ def Extract_Feature(example, tokenizer, max_seq_length = 512, doc_stride = 128, 
             all_doc_tokens, tok_start_position, tok_end_position, tokenizer,
             example.orig_answer_text)
         
-    # The -3 accounts for [CLS], [SEP] and [SEP]
-    max_tokens_for_doc = max_seq_length - len(query_tokens) - 3
-
+    # The -4 accounts for <s>, </s></s> and </s>
+    max_tokens_for_doc = max_seq_length - len(query_tokens) - 4
 
     _DocSpan = collections.namedtuple("DocSpan", ["start", "length"])
     doc_spans = []
@@ -446,14 +446,10 @@ def Extract_Feature(example, tokenizer, max_seq_length = 512, doc_stride = 128, 
         tokens = []
         token_to_orig_map = {}
         token_is_max_context = {}
-        segment_ids = []
-        tokens.append("[CLS]")
-        segment_ids.append(0)
+        tokens.append("<s>")
         for token in query_tokens:
             tokens.append(token)
-            segment_ids.append(0)
-        tokens.append("[SEP]")
-        segment_ids.append(0)
+        tokens.extend(["</s>","</s>"])
 
         for i in range(doc_span.length):
             split_token_index = doc_span.start + i
@@ -464,22 +460,23 @@ def Extract_Feature(example, tokenizer, max_seq_length = 512, doc_stride = 128, 
                                                    split_token_index)
             token_is_max_context[len(tokens)] = is_max_context
             tokens.append(all_doc_tokens[split_token_index])
-            segment_ids.append(1)
-        tokens.append("[SEP]")
-        segment_ids.append(1)
+        tokens.append("</s>")
+
         input_ids = tokenizer.convert_tokens_to_ids(tokens)
 
         # The mask has 1 for real tokens and 0 for padding tokens.
         input_mask = [1] * len(input_ids)
-
+        segment_ids = [0]*max_seq_length
+        # Zero-pad up to the sequence length.
         while len(input_ids) < max_seq_length:
-            input_ids.append(0)
+            input_ids.append(1)
             input_mask.append(0)
-            segment_ids.append(0)
 
         assert len(input_ids) == max_seq_length
         assert len(input_mask) == max_seq_length
         assert len(segment_ids) == max_seq_length
+
+        # rational_part
         doc_start = doc_span.start
         doc_end = doc_span.start + doc_span.length - 1
         out_of_span = False
@@ -490,9 +487,10 @@ def Extract_Feature(example, tokenizer, max_seq_length = 512, doc_stride = 128, 
             rational_start_position = 0
             rational_end_position = 0
         else:
-            doc_offset = len(query_tokens) + 2
+            doc_offset = len(query_tokens) + 3
             rational_start_position = tok_r_start_position - doc_start + doc_offset
             rational_end_position = tok_r_end_position - doc_start + doc_offset
+        # rational_part_end
 
         rational_mask = [0] * len(input_ids)
         if not out_of_span:
@@ -511,7 +509,7 @@ def Extract_Feature(example, tokenizer, max_seq_length = 512, doc_stride = 128, 
                 end_position = 0
                 slice_cls_idx = 2
             else:
-                doc_offset = len(query_tokens) + 2
+                doc_offset = len(query_tokens) + 3
                 start_position = tok_start_position - doc_start + doc_offset
                 end_position = tok_end_position - doc_start + doc_offset
         else:
@@ -520,7 +518,6 @@ def Extract_Feature(example, tokenizer, max_seq_length = 512, doc_stride = 128, 
 
         features.append(
             CoqaFeatures(example_index=0,
-                        
                          unique_id=0,
                          doc_span_index=doc_span_index,
                          tokens=tokens,
@@ -549,7 +546,7 @@ def Extract_Features(examples, tokenizer, max_seq_length, doc_stride, max_query_
         )
         features = list(
             tqdm(
-                p.imap(annotate_, examples, chunksize=32),
+                p.imap(annotate_, examples, chunksize=16),
                 total=len(examples),
                 desc="Extracting features from dataset",
             )
@@ -584,5 +581,3 @@ def Extract_Features(examples, tokenizer, max_seq_length, doc_stride, max_query_
                                 all_end_positions, all_rational_mask, all_cls_idx)
 
     return features, dataset
-
-

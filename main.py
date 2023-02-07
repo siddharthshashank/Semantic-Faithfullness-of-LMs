@@ -5,7 +5,7 @@ from tqdm import tqdm, trange
 from transformers import (AdamW, AutoConfig, AutoTokenizer, get_linear_schedule_with_warmup)
 from processors.coqa import Extract_Features, Processor, Result
 from processors.metrics import get_predictions
-from transformers import BertModel, BertPreTrainedModel, BertTokenizer, BertConfig
+from transformers import RobertaModel, RobertaTokenizer, RobertaConfig
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -14,16 +14,16 @@ import getopt,sys
 
 train_file="coqa-train-v1.0.json"
 predict_file="coqa-dev-v1.0.json"
-pretrained_model="bert-base-uncased"
+pretrained_model="roberta-base"
 epochs = 1.0
-evaluation_batch_size=16
-train_batch_size=4
+evaluation_batch_size = 16
+train_batch_size = 4
 MIN_FLOAT = -1e30
- 
-class BertBaseUncasedModel(BertPreTrainedModel):
-    def __init__(self,config,activation='relu'):
-        super(BertBaseUncasedModel, self).__init__(config)
-        self.bert = BertModel(config)
+
+class RobertaBaseModel(RobertaModel):
+    def __init__(self,config, load_pre = False):
+        super(RobertaBaseModel,self).__init__(config)
+        self.roberta = RobertaModel.from_pretrained(pretrained_model, config=config,) if load_pre else RobertaModel(config)
         hidden_size = config.hidden_size
         self.fc = nn.Linear(hidden_size,hidden_size, bias = False)
         self.fc2 = nn.Linear(hidden_size,hidden_size, bias = False)
@@ -34,12 +34,11 @@ class BertBaseUncasedModel(BertPreTrainedModel):
         self.yes_no_modelling = nn.Linear(2*hidden_size,2, bias = False)
         self.relu = nn.ReLU()
         self.beta = 5.0
-        self.init_weights()
 
     def forward(self,input_ids,segment_ids=None,input_masks=None,start_positions=None,end_positions=None,rationale_mask=None,cls_idx=None):
-        #   Bert-base outputs
-        outputs = self.bert(input_ids,token_type_ids=segment_ids,attention_mask=input_masks, head_mask = None)
-        output_vector, bert_pooled_output = outputs
+        #RoBERTa outputs
+        outputs = self.roberta(input_ids,attention_mask=input_masks)
+        output_vector, roberta_pooled_output = outputs
 
         start_end_logits = self.span_modelling(output_vector)
         start_logits, end_logits = start_end_logits.split(1, dim=-1)
@@ -57,13 +56,14 @@ class BertBaseUncasedModel(BertPreTrainedModel):
         attention = attention*input_masks + (1-input_masks)*MIN_FLOAT
         attention = F.softmax(attention, dim=-1)
         attention_pooled_output = (attention.unsqueeze(-1) * output_vector).sum(dim=-2)
-        cls_output = torch.cat((attention_pooled_output,bert_pooled_output),dim = -1)
+        cls_output = torch.cat((attention_pooled_output,roberta_pooled_output),dim = -1)
 
         rationale_logits = rationale_logits.squeeze(-1)
 
         unk_logits = self.unk_modelling(cls_output)
         yes_no_logits = self.yes_no_modelling(cls_output)
         yes_logits, no_logits = yes_no_logits.split(1, dim=-1)
+
 
         if self.training:
             start_positions, end_positions = start_positions + cls_idx, end_positions + cls_idx
@@ -83,20 +83,18 @@ class BertBaseUncasedModel(BertPreTrainedModel):
             return total_loss
         return start_logits, end_logits, yes_logits, no_logits, unk_logits
 
-
 def convert_to_list(tensor):
     return tensor.detach().cpu().tolist()
 
-def train(train_dataset, model, tokenizer, device, output_directory):
+def train(train_dataset, model, tokenizer, device):
 
     train_sampler = RandomSampler(train_dataset) 
     train_dataloader = DataLoader(train_dataset, sampler=train_sampler, batch_size=train_batch_size)
     t_total = len(train_dataloader) // 1 * epochs
     optimizer_parameters = [{"params": [p for n, p in model.named_parameters() if not any(nd in n for nd in ["bias", "LayerNorm.weight"])],"weight_decay": 0.01,},
                             {"params": [p for n, p in model.named_parameters() if any(nd in n for nd in ["bias", "LayerNorm.weight"])], "weight_decay": 0.0}]
-    optimizer = AdamW(optimizer_parameters,lr=3e-5, eps=1e-8)
+    optimizer = AdamW(optimizer_parameters,lr=1e-5, eps=1e-8)
     scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=2000, num_training_steps=t_total)
-
     if os.path.isfile(os.path.join(pretrained_model, "optimizer.pt")) and os.path.isfile(os.path.join(pretrained_model, "scheduler.pt")):
         optimizer.load_state_dict(torch.load(
             os.path.join(pretrained_model, "optimizer.pt")))
@@ -113,13 +111,12 @@ def train(train_dataset, model, tokenizer, device, output_directory):
         for i,batch in enumerate(epoch_iterator):
             model.train()
             batch = tuple(t.to(device) for t in batch)
-            inputs = { "input_ids": batch[0],"segment_ids": batch[1],
+            inputs = { "input_ids": batch[0],"segment_ids": None,
                   "input_masks": batch[2],"start_positions": batch[3],
                   "end_positions": batch[4],"rationale_mask": batch[5],"cls_idx": batch[6]}
             loss = model(**inputs)
             loss.backward()
             train_loss += loss.item()
-             #   optimizing training parameters
             optimizer.step()
             scheduler.step()  
             model.zero_grad()
@@ -137,7 +134,6 @@ def train(train_dataset, model, tokenizer, device, output_directory):
                 torch.save(optimizer.state_dict(), os.path.join(output_dir, "optimizer.pt"))
                 torch.save(scheduler.state_dict(), os.path.join(output_dir, "scheduler.pt"))
     return train_loss/counter
-
 
 def Write_predictions(model, tokenizer, device, dataset_type = None, output_directory = None):
     dataset, examples, features = load_dataset(tokenizer, evaluate=True,dataset_type = dataset_type)
@@ -168,7 +164,7 @@ def Write_predictions(model, tokenizer, device, dataset_type = None, output_dire
 
 def load_dataset(tokenizer, evaluate=False, dataset_type = None):
     input_dir = "data"
-    print(f"Creating features from dataset file at {input_dir}")
+    print("Creating features from dataset file at", input_dir)
 
     if ((evaluate and not predict_file) or (not evaluate and not train_file)):
         raise ValueError("predict_file or train_file name not found")
@@ -191,31 +187,33 @@ def load_dataset(tokenizer, evaluate=False, dataset_type = None):
 def manager(isTraining, dataset_type, output_directory):
     assert torch.cuda.is_available()
     device = torch.device('cuda')
-    config = BertConfig.from_pretrained(pretrained_model)
+    config = RobertaConfig.from_pretrained(pretrained_model)
+
     if isTraining:
-        tokenizer = BertTokenizer.from_pretrained(pretrained_model)
-        model = BertBaseUncasedModel.from_pretrained(pretrained_model, from_tf=bool(".ckpt" in pretrained_model), config=config,cache_dir=None,)
+        tokenizer = RobertaTokenizer.from_pretrained(pretrained_model)
+        model = RobertaBaseModel(config, load_pre = True)
         model.to(device)
-        if (os.path.exists(output_directory) and os.listdir(output_directory)):
+        if os.path.exists(output_directory):
             raise ValueError(f"Output directory {output_directory}  already exists, Change output_directory name")
         else:
             os.makedirs(output_directory)
-    
+        
         train_dataset = load_dataset(tokenizer, evaluate=False, dataset_type = dataset_type)
-        train_loss = train(train_dataset, model, tokenizer, device, output_directory)
-        model_to_save = model.module if hasattr(model, "module") else model
-        model_to_save.save_pretrained(output_directory)
+        train_loss = train(train_dataset, model, tokenizer, device)
         tokenizer.save_pretrained(output_directory)
+        torch.save(model.state_dict(), os.path.join(output_directory,'tweights.pt'))
+
     else:
-        model = BertBaseUncasedModel.from_pretrained(output_directory)
-        tokenizer = BertTokenizer.from_pretrained(output_directory, do_lower_case=True)
+        model = RobertaBaseModel(config)
+        model.load_state_dict(torch.load(os.path.join(output_directory,'tweights.pt')))
         model.to(device)
+        tokenizer = RobertaTokenizer.from_pretrained(output_directory, do_lower_case=True)
         Write_predictions(model, tokenizer, device, dataset_type = dataset_type[0], output_directory = output_directory)
 
 def main():
     isTraining,isEval = False, False
     train_dataset_type, eval_dataset_type = [],[]
-    output_directory = "Bert"
+    output_directory = "Roberta"
     argumentList = sys.argv[1:]
     options = "ht:e:o:"
     long_options = ["help", "train=","eval=", "output="]
@@ -228,8 +226,8 @@ def main():
                         --eval for eval on (O) original (TS) truncated and (RG) for TS-R dataset as defined in paper\n
                         --output [dir_name] is the output directory to write weights and predictions in, 
                         and in case of eval to load weights from.
-                        e.g. python main.py --train C --eval RG --output Bert_comb
-                        for combined training followed by eval on RG and writing to ./Bert_comb""")
+                        e.g. python main.py --train C --eval RG --output Roberta_comb
+                        for combined training followed by eval on RG and writing to ./Roberta_comb""")
                 return
      
             elif currentArgument in ("-t", "--train"):
