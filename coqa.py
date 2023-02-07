@@ -1,179 +1,181 @@
+import sys
 import collections
-import json
-import logging
 import os
-import re
-import string
-from collections import Counter
-from functools import partial
-from multiprocessing import Pool, cpu_count
-import spacy
+import os.path
+import json
+import numpy as np
 import torch
-from torch.utils.data import TensorDataset
+import string
+from string import punctuation as punct
+import re
+from transformers import XLNetTokenizer, XLNetConfig
+from multiprocessing import Pool, cpu_count
 from tqdm import tqdm
-from processors.utils import DataProcessor
+from torch.utils.data import TensorDataset
+import spacy
 
-class CoqaExample(object):
-    """Single CoQA example"""
-    def __init__(
-            self,
-            qas_id,
-            question_text,
-            doc_tokens,
-            orig_answer_text=None,
-            start_position=None,
-            end_position=None,
-            rational_start_position=None,
-            rational_end_position=None,
-            additional_answers=None,
-    ):
+train_file = "coqa-train-v1.0.json"
+test_file = "coqa-dev-v1.0.json"
+
+MIN_FLOAT = -1e30
+MAX_FLOAT = 1e30
+
+class InputExample(object):
+    def __init__(self,
+                 qas_id,
+                 question_text,
+                 paragraph_text,
+                 r_start = None,
+                 r_end = None,
+                 orig_answer_text=None,
+                 start_position=None,
+                 answer_type=None,
+                 answer_subtype=None,
+                 is_skipped=False):
         self.qas_id = qas_id
         self.question_text = question_text
-        self.doc_tokens = doc_tokens
+        self.paragraph_text = paragraph_text
+        self.r_start = r_start
+        self.r_end = r_end
         self.orig_answer_text = orig_answer_text
         self.start_position = start_position
-        self.end_position = end_position
-        self.additional_answers = additional_answers
-        self.rational_start_position = rational_start_position
-        self.rational_end_position = rational_end_position
+        self.answer_type = answer_type
+        self.answer_subtype = answer_subtype
+        self.is_skipped = is_skipped
+    
+    def __str__(self):
+        return self.__repr__()
+    
+    def __repr__(self):
+        s = "qas_id: %s" % (self.qas_id)
+        s += ", question_text: %s" % (self.question_text)
+        s += ", paragraph_text: [%s]" % (self.paragraph_text)
+        if self.start_position >= 0:
+            s += ", start_position: %d" % (self.start_position)
+            s += ", orig_answer_text: %s" % (self.orig_answer_text)
+            s += ", answer_type: %s" % (self.answer_type)
+            s += ", answer_subtype: %s" % (self.answer_subtype)
+            s += ", is_skipped: %r" % (self.is_skipped)
+        return "[{0}]\n".format(s)
 
-class CoqaFeatures(object):
-    """Single CoQA feature"""
+class InputFeatures(object):
     def __init__(self,
                  unique_id,
-                 example_index,
-                 doc_span_index,
-                 tokens,
-                 token_to_orig_map,
-                 token_is_max_context,
+                 qas_id,
+                 doc_idx,
+                 token2char_raw_start_index,
+                 token2char_raw_end_index,
+                 token2doc_index,
                  input_ids,
+                 input_tokens,
                  input_mask,
+                 p_mask,
                  segment_ids,
+                 cls_index,
+                 para_length,
+                 r_start=None,
+                 r_end=None,
                  start_position=None,
                  end_position=None,
-                 cls_idx=None,
-                 rational_mask=None):
+                 is_unk=None,
+                 is_yes=None,
+                 is_no=None,
+                 number=None,
+                 option=None):
         self.unique_id = unique_id
-        self.example_index = example_index
-        self.doc_span_index = doc_span_index
-        self.tokens = tokens
-        self.token_to_orig_map = token_to_orig_map
-        self.token_is_max_context = token_is_max_context
+        self.qas_id = qas_id
+        self.doc_idx = doc_idx
+        self.token2char_raw_start_index = token2char_raw_start_index
+        self.token2char_raw_end_index = token2char_raw_end_index
+        self.token2doc_index = token2doc_index
         self.input_ids = input_ids
+        self.input_tokens = input_tokens
         self.input_mask = input_mask
+        self.p_mask = p_mask
         self.segment_ids = segment_ids
+        self.cls_index = cls_index
+        self.para_length = para_length
+        self.r_start = r_start
+        self.r_end = r_end
         self.start_position = start_position
         self.end_position = end_position
-        self.cls_idx = cls_idx
-        self.rational_mask = rational_mask
+        self.is_unk = is_unk
+        self.is_yes = is_yes
+        self.is_no = is_no
+        self.number = number
+        self.option = option
 
-class Result(object):
-    def __init__(self, unique_id, start_logits, end_logits, yes_logits, no_logits, unk_logits):
+    def __str__(self):
+        return self.__repr__()
+
+    def __repr__(self):
+        s = "unique_id: %s" % (self.unique_id)
+        s += ", input_ids: [%s] \n" % (self.input_ids)
+        s += ", segment_ids: [%s] \n" % (self.segment_ids)
+        s += ", input_mask: [%s] \n" % (self.input_mask)
+        s += ", cls_idx: [%s] \n" % (self.cls_index)
+        s += ", answer: [%s] \n" % (self.input_ids[self.start_position:self.end_position+1])
+        return "[{0}]\n".format(s)
+
+
+class OutputResult(object):
+    def __init__(self,
+                 unique_id,
+                 unk_prob,
+                 yes_prob,
+                 no_prob,
+                 num_probs,
+                 opt_probs,
+                 start_prob,
+                 start_index,
+                 end_prob,
+                 end_index):
         self.unique_id = unique_id
-        self.start_logits = start_logits
-        self.end_logits = end_logits
-        self.yes_logits = yes_logits
-        self.no_logits = no_logits
-        self.unk_logits = unk_logits
-
-def _improve_answer_span(doc_tokens, input_start, input_end, tokenizer, orig_answer_text):
-    tok_answer_text = " ".join(tokenizer.tokenize(orig_answer_text))
-    for new_start in range(input_start, input_end + 1):
-        for new_end in range(input_end, new_start - 1, -1):
-            text_span = " ".join(doc_tokens[new_start: (new_end + 1)])
-            if text_span == tok_answer_text:
-                return (new_start, new_end)
-
-    return (input_start, input_end)
-
-def _check_is_max_context(doc_spans, cur_span_index, position):
-    best_score = None
-    best_span_index = None
-    for (span_index, doc_span) in enumerate(doc_spans):
-        end = doc_span.start + doc_span.length - 1
-        if position < doc_span.start:
-            continue
-        if position > end:
-            continue
-        num_left_context = position - doc_span.start
-        num_right_context = end - position
-        score = min(num_left_context, num_right_context) + 0.01 * doc_span.length
-        if best_score is None or score > best_score:
-            best_score = score
-            best_span_index = span_index
-
-    return cur_span_index == best_span_index
-
-class Processor(DataProcessor):
-    train_file = "coqa-train-v1.0.json"
-    dev_file = "coqa-dev-v1.0.json"
-
-    def is_whitespace(self, c):
-        if c == " " or c == "\t" or c == "\r" or c == "\n" or ord(c) == 0x202F:
-            return True
-        return False
-
-    def _str(self, s):
-        """ Convert PTB tokens to normal tokens """
-        if (s.lower() == '-lrb-'):
-            s = '('
-        elif (s.lower() == '-rrb-'):
-            s = ')'
-        elif (s.lower() == '-lsb-'):
-            s = '['
-        elif (s.lower() == '-rsb-'):
-            s = ']'
-        elif (s.lower() == '-lcb-'):
-            s = '{'
-        elif (s.lower() == '-rcb-'):
-            s = '}'
+        self.unk_prob = unk_prob
+        self.yes_prob = yes_prob
+        self.no_prob = no_prob
+        self.num_probs = num_probs
+        self.opt_probs = opt_probs
+        self.start_prob = start_prob
+        self.start_index = start_index
+        self.end_prob = end_prob
+        self.end_index = end_index
+    def __str__(self):
+        return self.__repr__()
+    def __repr__(self):
+        s = f"""unique_id: {self.unique_id} \n unk: {self.unk_prob} 
+            \n yes: {self.yes_prob}\n no {self.no_prob} 
+            \n sentence: {self.start_index}:{self.end_index}"""
         return s
 
-    def space_extend(self, matchobj):
-        return ' ' + matchobj.group(0) + ' '
+class CoqaPipeline(object):
+    def __init__(self, data_dir = "./data", num_turn = 2):
+        self.data_dir = data_dir
+        self.num_turn = num_turn
+    
+    def get_train_examples(self, dataset_type = None):
+        data_path = os.path.join(self.data_dir, train_file)
+        data_list = self._read_json(data_path)
+        example_list = self._get_example(data_list,dataset_type = dataset_type)
+        example_list = [example for example in example_list if not example.is_skipped]
+        return example_list
+    
+    def get_dev_examples(self, dataset_type = None, attention = False):
+        data_path = os.path.join(self.data_dir, test_file)
+        data_list = self._read_json(data_path)
+        example_list = self._get_example(data_list,dataset_type = dataset_type, attention = attention)
+        return example_list
+    
+    def _read_json(self, data_path):
+        if os.path.exists(data_path):
+            with open(data_path, "r") as file:
+                data_list = json.load(file)["data"]
+                return data_list
+        else:
+            raise FileNotFoundError("data path not found: {0}".format(data_path))
 
-    def pre_proc(self, text):
-        text = re.sub(u'-|\u2010|\u2011|\u2012|\u2013|\u2014|\u2015|%|\[|\]|:|\(|\)|/|\t', self.space_extend, text)
-        text = text.strip(' \n')
-        text = re.sub('\s+', ' ', text)
-        return text
-
-    def process(self, parsed_text):
-        output = {'word': [], 'offsets': [], 'sentences': []}
-        for token in parsed_text:
-            output['word'].append(self._str(token.text))
-            output['offsets'].append((token.idx, token.idx + len(token.text)))
-        word_idx = 0
-        for sent in parsed_text.sents:
-            output['sentences'].append((word_idx, word_idx + len(sent)))
-            word_idx += len(sent)
-        assert word_idx == len(output['word'])
-        return output
-
-    def get_raw_context_offsets(self, words, raw_text):
-        raw_context_offsets = []
-        p = 0
-        for token in words:
-            while p < len(raw_text) and re.match('\s', raw_text[p]):
-                p += 1
-            if raw_text[p:p + len(token)] != token:
-                print('something is wrong! token', token, 'raw_text:', raw_text)
-
-            raw_context_offsets.append((p, p + len(token)))
-            p += len(token)
-        return raw_context_offsets
-
-    def find_span(self, offsets, start, end):
-        start_index = -1
-        end_index = -1
-        for i, offset in enumerate(offsets):
-            if (start_index < 0) or (start >= offset[0]):
-                start_index = i
-            if (end_index < 0) and (end <= offset[1]):
-                end_index = i
-        return (start_index, end_index)
-
-    def normalize_answer(self, s):
+    @staticmethod
+    def normalize_answer(s):
         def remove_articles(text):
             regex = re.compile(r'\b(a|an|the)\b', re.UNICODE)
             return re.sub(regex, ' ', text)
@@ -189,395 +191,944 @@ class Processor(DataProcessor):
             return text.lower()
         return white_space_fix(remove_articles(remove_punc(lower(s))))
 
-    def find_span_with_gt(self, context, offsets, ground_truth):
+    def _whitespace_tokenize(self, text):
+        word_spans = []
+        char_list = []
+        for idx, char in enumerate(text):
+            if char != ' ':
+                char_list.append(idx)
+                continue
+            
+            if char_list:
+                word_start = char_list[0]
+                word_end = char_list[-1]
+                word_text = text[word_start:word_end+1]
+                word_spans.append((word_text, word_start, word_end))
+                char_list.clear()
+        
+        if char_list:
+            word_start = char_list[0]
+            word_end = char_list[-1]
+            word_text = text[word_start:word_end+1]
+            word_spans.append((word_text, word_start, word_end))
+        
+        return word_spans
+    
+    def _char_span_to_word_span(self,
+                                char_start,
+                                char_end,
+                                word_spans):
+        word_idx_list = []
+        for word_idx, (_, start, end) in enumerate(word_spans):
+            if end >= char_start:
+                if start <= char_end:
+                    word_idx_list.append(word_idx)
+                else:
+                    break
+        
+        if word_idx_list:
+            word_start = word_idx_list[0]
+            word_end = word_idx_list[-1]
+        else:
+            word_start = -1
+            word_end = -1
+        
+        return word_start, word_end
+    
+    def _search_best_span(self,
+                          context_tokens,
+                          answer_tokens):
         best_f1 = 0.0
-        best_span = (len(offsets) - 1, len(offsets) - 1)
-        gt = self.normalize_answer(self.pre_proc(ground_truth)).split()
-
-        ls = [
-            i for i in range(len(offsets))
-            if context[offsets[i][0]:offsets[i][1]].lower() in gt
-        ]
-
-        for i in range(len(ls)):
-            for j in range(i, len(ls)):
-                pred = self.normalize_answer(
-                    self.pre_proc(
-                        context[offsets[ls[i]][0]:offsets[ls[j]][1]])).split()
-                common = Counter(pred) & Counter(gt)
-                num_same = sum(common.values())
-                if num_same > 0:
-                    precision = 1.0 * num_same / len(pred)
-                    recall = 1.0 * num_same / len(gt)
+        best_start, best_end = -1, -1
+        search_index = [idx for idx in range(len(context_tokens)) if context_tokens[idx][0] in answer_tokens]
+        for i in range(len(search_index)):
+            for j in range(i, len(search_index)):
+                candidate_tokens = [context_tokens[k][0] for k in range(search_index[i], search_index[j]+1) if context_tokens[k][0]]
+                common = collections.Counter(candidate_tokens) & collections.Counter(answer_tokens)
+                num_common = sum(common.values())
+                if num_common > 0:
+                    precision = 1.0 * num_common / len(candidate_tokens)
+                    recall = 1.0 * num_common / len(answer_tokens)
                     f1 = (2 * precision * recall) / (precision + recall)
                     if f1 > best_f1:
                         best_f1 = f1
-                        best_span = (ls[i], ls[j])
-        return best_span
-
-    def cut_sentence(self,doc_tok, r_start, r_end,dataset_type, nlp_context):
-        if dataset_type in ['TS','RG']:
-            if dataset_type == "TS":
-                edge,inc = r_end,True
-            elif dataset_type == "RG":
-                edge,inc = r_start,False
-            for i,j in nlp_context:
-                if edge >= i and edge <= j:
-                    sent = j if inc else i
-            doc_tok = doc_tok[:sent]
-            return doc_tok
-        else:
-            return doc_tok
-
-    def get_examples(self, data_dir, history_len, filename=None, threads=1,dataset_type = None, attention = False):
-        if data_dir is None:
-            data_dir = ""
-
-        with open(
-                os.path.join(data_dir, self.train_file if filename is None else filename), "r", encoding="utf-8"
-        ) as reader:
-            input_data = json.load(reader)["data"]
-
-        threads = min(threads, cpu_count())
-        with Pool(threads) as p:
-            annotate_ = partial(self._create_examples, history_len=history_len, dataset_type = dataset_type, attention = attention)
-            examples = list(tqdm(
-                p.imap(annotate_, input_data),
-                total=len(input_data),
-                desc="Preprocessing examples",
-            ))
-        examples = [item for sublist in examples for item in sublist]
-        return examples
-
-    def _create_examples(self, input_data, history_len,dataset_type = None, attention = False):
-        nlp = spacy.load('en_core_web_sm', parser=False)
-        examples = []
-        datum = input_data
-        context_str = datum['story']
-        _datum = {
-            'context': context_str,
-            'source': datum['source'],
-            'id': datum['id'],
-            'filename': datum['filename']
-        }
-        nlp_context = nlp(self.pre_proc(context_str))
-        _datum['annotated_context'] = self.process(nlp_context)
-        _datum['raw_context_offsets'] = self.get_raw_context_offsets(_datum['annotated_context']['word'], context_str)
-        assert len(datum['questions']) == len(datum['answers'])
-        additional_answers = {}
-        if 'additional_answers' in datum:
-            for k, answer in datum['additional_answers'].items():
-                if len(answer) == len(datum['answers']):
-                    for ex in answer:
-                        idx = ex['turn_id']
-                        if idx not in additional_answers:
-                            additional_answers[idx] = []
-                        additional_answers[idx].append(ex['input_text'])
-        for i in range(len(datum['questions'])):
-            question, answer = datum['questions'][i], datum['answers'][i]
-            assert question['turn_id'] == answer['turn_id']
-
-            idx = question['turn_id']
-            _qas = {
-                'turn_id': idx,
-                'question': question['input_text'],
-                'answer': answer['input_text']
-            }
-            if idx in additional_answers:
-                _qas['additional_answers'] = additional_answers[idx]
-
-            _qas['raw_answer'] = answer['input_text']
-
-            if _qas['raw_answer'].lower() in ['yes', 'yes.']:
-                _qas['raw_answer'] = 'yes'
-            if _qas['raw_answer'].lower() in ['no', 'no.']:
-                _qas['raw_answer'] = 'no'
-            if _qas['raw_answer'].lower() in ['unknown', 'unknown.']:
-                _qas['raw_answer'] = 'unknown'
-
-            _qas['answer_span_start'] = answer['span_start']
-            _qas['answer_span_end'] = answer['span_end']
-            start = answer['span_start']
-            end = answer['span_end']
-            chosen_text = _datum['context'][start:end].lower()
-            while len(chosen_text) > 0 and self.is_whitespace(chosen_text[0]):
-                chosen_text = chosen_text[1:]
-                start += 1
-            while len(chosen_text) > 0 and self.is_whitespace(chosen_text[-1]):
-                chosen_text = chosen_text[:-1]
-                end -= 1
-            r_start, r_end = self.find_span(_datum['raw_context_offsets'], start, end)
-            input_text = _qas['answer'].strip().lower()
-
-            if input_text in chosen_text:
-                p = chosen_text.find(input_text)
-                _qas['answer_span'] = self.find_span(_datum['raw_context_offsets'], start + p, start + p + len(input_text))
-            else:
-                if dataset_type == 'TS':
-                    pos = _datum['raw_context_offsets'][r_end][1]
-                    _qas['answer_span'] = self.find_span_with_gt( _datum['context'][:pos], _datum['raw_context_offsets'][:r_end+1], input_text)
-                else:
-                    _qas['answer_span'] = self.find_span_with_gt(_datum['context'], _datum['raw_context_offsets'], input_text)
-
-            long_questions = []
-            for j in range(i - history_len, i + 1):
-                long_question = ''
-                if j < 0:
-                    continue
-
-                long_question += '|Q| ' + datum['questions'][j]['input_text']
-                if j < i:
-                    long_question += '|A| ' + datum['answers'][j]['input_text'] + ' '
-
-                long_question = long_question.strip()
-                long_questions.append(long_question)
-
-            doc_tok = _datum['annotated_context']['word']
-            doc_tok = self.cut_sentence(doc_tok, r_start, r_end, dataset_type,_datum['annotated_context']['sentences'])
-            if len(doc_tok) == 0:
-                continue
-
-            if dataset_type == "RG":
-                r_start,r_end = -1,-1
-                gt = _qas['raw_answer']
-                gt_context = nlp(self.pre_proc(gt))
-                _gt = self.process(gt_context)['word']
-                found = " ".join(doc_tok).find(gt)
-                if gt not in ['unknown','yes','no']:
-                    if found == -1 and not attention:
-                        doc_tok.append(gt)
-                    elif found != -1 and not attention:
-                        r_start,r_end = -1,-1
-                    elif found == -1 and attention:
-                        r_start,r_end = len(doc_tok),len(doc_tok)+len(_gt)-1
-                        doc_tok.extend(_gt)
-                    else:
-                        for i in range(0,len(doc_tok)):
-                            if doc_tok[i:i+len(_gt)] == _gt:
-                                r_start = i 
-                                r_end = r_start + len(_gt)-1
-                        if r_start == r_end:
-                            continue
-                elif attention:
-                    continue
-
-            example = CoqaExample(
-                qas_id = _datum['id'] + ' ' + str(_qas['turn_id']),
-                question_text = long_questions,
-                doc_tokens = doc_tok,
-                orig_answer_text = _qas['raw_answer'] if dataset_type in [None,'TS'] else 'unknown',
-                start_position = _qas['answer_span'][0] if dataset_type in [None,'TS'] else 0, 
-                end_position = _qas['answer_span'][1] if dataset_type in [None,'TS'] else 0,
-                rational_start_position = r_start,
-                rational_end_position = r_end,
-                additional_answers=_qas['additional_answers'] if 'additional_answers' in _qas else None,
-            )
-            examples.append(example)
-
-        return examples
-
-
-def Extract_Feature_init(tokenizer_for_convert):
-    global tokenizer
-    tokenizer = tokenizer_for_convert
-
-def Extract_Feature(example, tokenizer, max_seq_length = 512, doc_stride = 128, max_query_length = 64):
-    features = []
-    query_tokens = []
-    for question_answer in example.question_text:
-        query_tokens.extend(tokenizer.tokenize(question_answer))
-
-    cls_idx = 3
-    if example.orig_answer_text == 'yes':
-        cls_idx = 0  # yes
-    elif example.orig_answer_text == 'no':
-        cls_idx = 1  # no
-    elif example.orig_answer_text == 'unknown':
-        cls_idx = 2  # unknown
-
-    if len(query_tokens) > max_query_length:
-        # keep tail
-        query_tokens = query_tokens[-max_query_length:]
-
-    tok_to_orig_index = []
-    orig_to_tok_index = []
-    all_doc_tokens = []
-    for (i, token) in enumerate(example.doc_tokens):
-        orig_to_tok_index.append(len(all_doc_tokens))
-        sub_tokens = tokenizer.tokenize(token)
-        for sub_token in sub_tokens:
-            tok_to_orig_index.append(i)
-            all_doc_tokens.append(sub_token)
-
-    tok_r_start_position = orig_to_tok_index[example.rational_start_position]
-    if example.rational_end_position < len(example.doc_tokens) - 1:
-        tok_r_end_position = orig_to_tok_index[example.rational_end_position + 1] - 1
-    else:
-        tok_r_end_position = len(all_doc_tokens) - 1
-    if cls_idx < 3:
-        tok_start_position, tok_end_position = 0, 0
-    else:
-        tok_start_position = orig_to_tok_index[example.start_position]
-        if example.end_position < len(example.doc_tokens) - 1:
-            tok_end_position = orig_to_tok_index[example.end_position + 1] - 1
-        else:
-            tok_end_position = len(all_doc_tokens) - 1
-        (tok_start_position, tok_end_position) = _improve_answer_span(
-            all_doc_tokens, tok_start_position, tok_end_position, tokenizer,
-            example.orig_answer_text)
+                        best_start = context_tokens[search_index[i]][1]
+                        best_end = context_tokens[search_index[j]][2]
         
-    # The -4 accounts for <s>, </s></s> and </s>
-    max_tokens_for_doc = max_seq_length - len(query_tokens) - 4
-
-    _DocSpan = collections.namedtuple("DocSpan", ["start", "length"])
-    doc_spans = []
-    start_offset = 0
-    while start_offset < len(all_doc_tokens):
-        length = len(all_doc_tokens) - start_offset
-        if length > max_tokens_for_doc:
-            length = max_tokens_for_doc
-        doc_spans.append(_DocSpan(start=start_offset, length=length))
-        if start_offset + length == len(all_doc_tokens):
-            break
-        start_offset += min(length, doc_stride)
-
-    for (doc_span_index, doc_span) in enumerate(doc_spans):
-        slice_cls_idx = cls_idx
-        tokens = []
-        token_to_orig_map = {}
-        token_is_max_context = {}
-        tokens.append("<s>")
-        for token in query_tokens:
-            tokens.append(token)
-        tokens.extend(["</s>","</s>"])
-
-        for i in range(doc_span.length):
-            split_token_index = doc_span.start + i
-            token_to_orig_map[len(tokens)] = tok_to_orig_index[split_token_index]
-
-            is_max_context = _check_is_max_context(doc_spans,
-                                                   doc_span_index,
-                                                   split_token_index)
-            token_is_max_context[len(tokens)] = is_max_context
-            tokens.append(all_doc_tokens[split_token_index])
-        tokens.append("</s>")
-
-        input_ids = tokenizer.convert_tokens_to_ids(tokens)
-
-        # The mask has 1 for real tokens and 0 for padding tokens.
-        input_mask = [1] * len(input_ids)
-        segment_ids = [0]*max_seq_length
-        # Zero-pad up to the sequence length.
-        while len(input_ids) < max_seq_length:
-            input_ids.append(1)
-            input_mask.append(0)
-
-        assert len(input_ids) == max_seq_length
-        assert len(input_mask) == max_seq_length
-        assert len(segment_ids) == max_seq_length
-
-        # rational_part
-        doc_start = doc_span.start
-        doc_end = doc_span.start + doc_span.length - 1
-        out_of_span = False
-        if example.rational_start_position == -1 or not (
-                tok_r_start_position >= doc_start and tok_r_end_position <= doc_end):
-            out_of_span = True
-        if out_of_span:
-            rational_start_position = 0
-            rational_end_position = 0
+        return best_f1, best_start, best_end
+    
+    def _get_question_text(self,
+                           history,
+                           question):
+        question_tokens = ['<s>'] + question["input_text"].split(' ')
+        return " ".join(history + [" ".join(question_tokens)])
+    
+    def _get_question_history(self,
+                              history,
+                              question,
+                              answer,
+                              answer_type,
+                              num_turn):
+        question_tokens = []
+        if answer_type != "unknown":
+            question_tokens.extend(['<s>'] + question["input_text"].split(' '))
+            question_tokens.extend(['</s>'] + answer["input_text"].split(' '))
+        
+        question_text = " ".join(question_tokens)
+        if question_text:
+            history.append(question_text)
+        
+        if num_turn >= 0 and len(history) > num_turn:
+            history = history[-num_turn:]
+        
+        return history
+    
+    def _find_answer_span(self,
+                          answer_text,
+                          rationale_text,
+                          rationale_start,
+                          rationale_end):
+        idx = rationale_text.find(answer_text)
+        answer_start = rationale_start + idx
+        answer_end = answer_start + len(answer_text) - 1
+        
+        return answer_start, answer_end
+    
+    def _match_answer_span(self,
+                           answer_text,
+                           rationale_start,
+                           rationale_end,
+                           paragraph_text):
+        answer_tokens = self._whitespace_tokenize(answer_text)
+        answer_norm_tokens = [self.normalize_answer(token) for token, _, _ in answer_tokens]
+        answer_norm_tokens = [norm_token for norm_token in answer_norm_tokens if norm_token]
+        
+        if not answer_norm_tokens:
+            return -1, -1
+        
+        paragraph_tokens = self._whitespace_tokenize(paragraph_text)
+        
+        if not (rationale_start == -1 or rationale_end == -1):
+            rationale_word_start, rationale_word_end = self._char_span_to_word_span(rationale_start, rationale_end, paragraph_tokens)
+            rationale_tokens = paragraph_tokens[rationale_word_start:rationale_word_end+1]
+            rationale_norm_tokens = [(self.normalize_answer(token), start, end) for token, start, end in rationale_tokens]
+            match_score, answer_start, answer_end = self._search_best_span(rationale_norm_tokens, answer_norm_tokens)
+            
+            if match_score > 0.0:
+                return answer_start, answer_end
+        
+        paragraph_norm_tokens = [(self.normalize_answer(token), start, end) for token, start, end in paragraph_tokens]
+        match_score, answer_start, answer_end = self._search_best_span(paragraph_norm_tokens, answer_norm_tokens)
+        
+        if match_score > 0.0:
+            return answer_start, answer_end
+        
+        return -1, -1
+    
+    def _get_answer_span(self, answer, answer_type, paragraph_text):
+        input_text = answer["input_text"].strip().lower()
+        span_start, span_end = answer["span_start"], answer["span_end"]
+        if span_start == -1 or span_end == -1:
+            span_text = ""
         else:
-            doc_offset = len(query_tokens) + 3
-            rational_start_position = tok_r_start_position - doc_start + doc_offset
-            rational_end_position = tok_r_end_position - doc_start + doc_offset
-        # rational_part_end
+            span_text = paragraph_text[span_start:span_end].lower()
+        
+        if input_text in span_text:
+            span_start, span_end = self._find_answer_span(input_text, span_text, span_start, span_end)
+        else:
+            span_start, span_end = self._match_answer_span(input_text, span_start, span_end, paragraph_text.lower())
+        
+        if span_start == -1 or span_end == -1:
+            answer_text = ""
+            is_skipped = (answer_type == "span")
+        else:
+            answer_text = paragraph_text[span_start:span_end+1]
+            is_skipped = False
+        
+        return answer_text, span_start, span_end, is_skipped
+    def _str(self, s):
+        """ Convert PTB tokens to normal tokens """
+        if (s.lower() == '-lrb-'):
+            s = '('
+        elif (s.lower() == '-rrb-'):
+            s = ')'
+        elif (s.lower() == '-lsb-'):
+            s = '['
+        elif (s.lower() == '-rsb-'):
+            s = ']'
+        elif (s.lower() == '-lcb-'):
+            s = '{'
+        elif (s.lower() == '-rcb-'):
+            s = '}'
+        return s
+    def _normalize_answer(self, answer):
+        norm_answer = self.normalize_answer(answer)
+        
+        if norm_answer in ["yes", "yese", "ye", "es"]:
+            return "yes"
+        
+        if norm_answer in ["no", "no not at all", "not", "not at all", "not yet", "not really"]:
+            return "no"
+        
+        return norm_answer
+    
+    def _get_answer_type(self, question, answer):
+        norm_answer = self._normalize_answer(answer["input_text"])
+        if norm_answer == "unknown" or "bad_turn" in answer:
+            return "unknown", None
+        if norm_answer == "yes":
+            return "yes", None
+        if norm_answer == "no":
+            return "no", None
+        if norm_answer in ["none", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten"]:
+            return "number", norm_answer
+        norm_question_tokens = self.normalize_answer(question["input_text"]).split(" ")
+        if "or" in norm_question_tokens:
+            index = norm_question_tokens.index("or")
+            if index-1 >= 0 and index+1 < len(norm_question_tokens):
+                if norm_answer == norm_question_tokens[index-1]:
+                    norm_answer = "option_a"
+                elif norm_answer == norm_question_tokens[index+1]:
+                    norm_answer = "option_b"
+        
+        if norm_answer in ["option_a", "option_b"]:
+            return "option", norm_answer
+        
+        return "span", None
+    
+    def _process_found_answer(self,
+                              raw_answer,
+                              found_answer):
+        raw_answer_tokens = raw_answer.split(' ')
+        found_answer_tokens = found_answer.split(' ')
+        
+        raw_answer_last_token = raw_answer_tokens[-1].lower()
+        found_answer_last_token = found_answer_tokens[-1].lower()
+        
+        if (raw_answer_last_token != found_answer_last_token and
+            raw_answer_last_token == found_answer_last_token.rstrip(string.punctuation)):
+            found_answer_tokens[-1] = found_answer_tokens[-1].rstrip(string.punctuation)
+        
+        return ' '.join(found_answer_tokens)
+    def process(self, parsed_text):
+        output = {'word': [], 'offsets': [], 'sentences': []}
 
-        rational_mask = [0] * len(input_ids)
-        if not out_of_span:
-            rational_mask[rational_start_position:rational_end_position + 1] = [1] * (
-                        rational_end_position - rational_start_position + 1)
+        for token in parsed_text:
+            output['word'].append(self._str(token.text))
+            output['offsets'].append((token.idx, token.idx + len(token.text)))
 
-        if cls_idx >= 3:
-            # For training, if our document chunk does not contain an annotation we remove it
-            doc_start = doc_span.start
-            doc_end = doc_span.start + doc_span.length - 1
-            out_of_span = False
-            if not (tok_start_position >= doc_start and tok_end_position <= doc_end):
-                out_of_span = True
-            if out_of_span:
-                start_position = 0
-                end_position = 0
-                slice_cls_idx = 2
+        word_idx = 0
+        for sent in parsed_text.sents:
+            output['sentences'].append((word_idx, word_idx + len(sent)))
+            word_idx += len(sent)
+
+        assert word_idx == len(output['word'])
+        return output
+    def _get_example(self, data_list,dataset_type = None,attention = False):
+        nlp = spacy.load('en_core_web_sm', parser=False) 
+        examples = []
+        for cnt,data in tqdm(enumerate(data_list),total = len(data_list),desc = "Preprocessing "):
+            data_id = data["id"]
+            paragraph_text = data["story"]
+            
+            questions = sorted(data["questions"], key=lambda x: x["turn_id"])
+            answers = sorted(data["answers"], key=lambda x: x["turn_id"])
+            
+            question_history = []
+            qas = list(zip(questions, answers))
+            parsed = nlp(paragraph_text)
+            nlp_contexts = self.process(parsed)
+
+            for i, (question, answer) in enumerate(qas):
+                qas_id = "{0}_{1}".format(data_id, i+1)
+                #qas_id = "{0}_{1}".format(data_id, str(question["turn_id"]))
+                answer_type, answer_subtype = self._get_answer_type(question, answer)
+                question_text = self._get_question_text(question_history, question)
+                question_history = self._get_question_history(question_history, question, answer, answer_type, self.num_turn)
+                r_start, r_end = answer['span_start'],answer['span_end']
+
+                if dataset_type is not None:
+                    if dataset_type == "TS":
+                        edge,inc = r_end,True
+                    elif dataset_type == "RG":
+                        edge,inc = r_start,False
+                        r_start,r_end = -1,-1
+                    if edge != -1:
+                        for m,(a,b) in enumerate(nlp_contexts['offsets']):
+                            if a <= edge <= b:
+                                edge = m+1 
+                                break
+                        for (a,b) in nlp_contexts['sentences']:
+                            if a <= edge < b:
+                                sent = b if inc else a
+                                break
+                        paragraph_text = str(parsed[:sent])
+                        if r_start > len(paragraph_text):
+                            continue
+                    if len(paragraph_text) == 0:
+                        continue
+                #answer_type, answer_subtype = self._get_answer_type(question, answer)
+
+                if dataset_type == "RG" and answer_type == "span":
+                    gt = answer['input_text']
+                    f = paragraph_text.find(gt)
+                    if  f == -1:
+                        r_start = len(paragraph_text)
+                        paragraph_text = paragraph_text + ' ' + gt
+                        r_end = len(paragraph_text)-1
+                    elif  f != -1 and not attention:
+                        paragraph_text = paragraph_text
+                    else:
+                        st = (paragraph_text[f-1].isspace()) or (paragraph_text[f-1] in punct) if f!= 0 else True
+                        en = (paragraph_text[f+len(gt)] in punct) or (paragraph_text[f+len(gt)].isspace()) if (f+len(gt) < len(paragraph_text)) else True
+                        if st and en:
+                            r_start,r_end = f,f+len(gt)-1
+                        else:
+                            continue
+                if len(paragraph_text) == 0:
+                    continue
+                answer_text, span_start, span_end, is_skipped = self._get_answer_span(answer, answer_type, paragraph_text)
+                #question_text = self._get_question_text(question_history, question)
+                #question_history = self._get_question_history(question_history, question, answer, answer_type, self.num_turn)
+
+                if answer_type not in ["unknown", "yes", "no"] and not is_skipped and answer_text:
+                    start_position = span_start
+                    orig_answer_text = self._process_found_answer(answer["input_text"], answer_text)
+                else:
+                    start_position = -1
+                    orig_answer_text = ""
+                
+                example = InputExample(
+                    qas_id=qas_id,
+                    question_text=question_text,
+                    paragraph_text=paragraph_text,
+                    r_start = r_start if attention else None,
+                    r_end = r_end if attention else None,
+                    orig_answer_text= orig_answer_text if dataset_type in [None,'TS'] else "unknown",
+                    start_position=start_position if dataset_type in [None, 'TS'] else 0,
+                    answer_type=answer_type if dataset_type in [None,'TS'] else "unknown",
+                    answer_subtype=answer_subtype if dataset_type in [None,'TS'] else None,
+                    is_skipped=is_skipped)
+
+                examples.append(example)
+        return examples
+
+class Tokenizer(object):
+
+    def __init__(self, pretrained_model_or_dir):
+        self.tokenizer = XLNetTokenizer.from_pretrained(pretrained_model_or_dir)
+        self.do_lower_case = self.tokenizer.do_lower_case
+
+    def tokenize(self, text):
+        return self.tokenizer._tokenize(text)
+
+    def preprocess_text(self, text):
+        return self.tokenizer.preprocess_text(text)
+
+    def tokens_to_ids(self, tokens):
+        return [self.tokenizer._convert_token_to_id(token) for token in tokens]
+
+    def save_pretrained(self, output_directory):
+        self.tokenizer.save_pretrained(output_directory)
+    
+
+class XLNetExampleProcessor(object):
+    def __init__(self, tokenizer, max_seq_length = 512, max_query_length = 128, doc_stride = 128, ):
+
+        self.special_vocab_list = ["<unk>", "<s>", "</s>", "<cls>", "<sep>", "<pad>", "<mask>", "<eod>", "<eop>"]
+        self.special_vocab_map = {}
+        for (i, special_vocab) in enumerate(self.special_vocab_list):
+            self.special_vocab_map[special_vocab] = i
+        
+        self.segment_vocab_list = ["<p>", "<q>", "<cls>", "<pad>"]
+        self.segment_vocab_map = {"<p>":0, "<q>":1, "<cls>":1, "<pad>":1}
+        
+        self.max_seq_length = max_seq_length
+        self.max_query_length = max_query_length
+        self.doc_stride = doc_stride
+        self.tokenizer = tokenizer
+        self.unique_id = 1000000000
+    
+    def _generate_match_mapping(self, para_text, tokenized_para_text, N, M, max_N, max_M):
+        def _lcs_match(para_text, tokenized_para_text, N, M, max_N, max_M, max_dist):
+            f = np.zeros((max_N, max_M), dtype=np.float32)
+            g = {}
+            
+            for i in range(N):
+                for j in range(i - max_dist, i + max_dist):
+                    if j >= M or j < 0:
+                        continue
+                    
+                    if i > 0:
+                        g[(i, j)] = 0
+                        f[i, j] = f[i - 1, j]
+                    
+                    if j > 0 and f[i, j - 1] > f[i, j]:
+                        g[(i, j)] = 1
+                        f[i, j] = f[i, j - 1]
+                    
+                    f_prev = f[i - 1, j - 1] if i > 0 and j > 0 else 0
+                    
+                    raw_char = self.tokenizer.preprocess_text(para_text[i])
+                    tokenized_char = tokenized_para_text[j]
+                    if (raw_char == tokenized_char and f_prev + 1 > f[i, j]):
+                        g[(i, j)] = 2
+                        f[i, j] = f_prev + 1
+            
+            return f, g
+        
+        max_dist = abs(N - M) + 5
+        for _ in range(2):
+            lcs_matrix, match_mapping = _lcs_match(para_text, tokenized_para_text, N, M, max_N, max_M, max_dist)
+            
+            if lcs_matrix[N - 1, M - 1] > 0.8 * N:
+                break
+            
+            max_dist *= 2
+        
+        mismatch = lcs_matrix[N - 1, M - 1] < 0.8 * N
+        return match_mapping, mismatch
+    
+    def _convert_tokenized_index(self, index, pos, M=None, is_start=True):
+        """Convert index for tokenized text"""
+        if index[pos] is not None:
+            return index[pos]
+        
+        N = len(index)
+        rear = pos
+        while rear < N - 1 and index[rear] is None:
+            rear += 1
+        
+        front = pos
+        while front > 0 and index[front] is None:
+            front -= 1
+        
+        assert index[front] is not None or index[rear] is not None
+        
+        if index[front] is None:
+            if index[rear] >= 1:
+                if is_start:
+                    return 0
+                else:
+                    return index[rear] - 1
+            
+            return index[rear]
+        
+        if index[rear] is None:
+            if M is not None and index[front] < M - 1:
+                if is_start:
+                    return index[front] + 1
+                else:
+                    return M - 1
+            
+            return index[front]
+        
+        if is_start:
+            if index[rear] > index[front] + 1:
+                return index[front] + 1
             else:
-                doc_offset = len(query_tokens) + 3
-                start_position = tok_start_position - doc_start + doc_offset
-                end_position = tok_end_position - doc_start + doc_offset
+                return index[rear]
         else:
-            start_position = 0
-            end_position = 0
+            if index[rear] > index[front] + 1:
+                return index[rear] - 1
+            else:
+                return index[front]
+    
+    def _find_max_context(self, doc_spans, token_idx):
+        best_doc_score = None
+        best_doc_idx = None
+        for (doc_idx, doc_span) in enumerate(doc_spans):
+            doc_start = doc_span["start"]
+            doc_length = doc_span["length"]
+            doc_end = doc_start + doc_length - 1
+            if token_idx < doc_start or token_idx > doc_end:
+                continue
+            
+            left_context_length = token_idx - doc_start
+            right_context_length = doc_end - token_idx
+            doc_score = min(left_context_length, right_context_length) + 0.01 * doc_length
+            if best_doc_score is None or doc_score > best_doc_score:
+                best_doc_score = doc_score
+                best_doc_idx = doc_idx
+        
+        return best_doc_idx
+    
+    def convert_coqa_example(self, example):
+        query_tokens = []
+        qa_texts = example.question_text.split('<s>')
+        for qa_text in qa_texts:
+            qa_text = qa_text.strip()
+            if not qa_text:
+                continue
+            
+            query_tokens.append('<s>')
+            
+            qa_items = qa_text.split('</s>')
+            if len(qa_items) < 1:
+                continue
+            
+            q_text = qa_items[0].strip()
+            q_tokens = self.tokenizer.tokenize(q_text)
+            query_tokens.extend(q_tokens)
+            
+            if len(qa_items) < 2:
+                continue
+            
+            query_tokens.append('</s>')
+            
+            a_text = qa_items[1].strip()
+            a_tokens = self.tokenizer.tokenize(a_text)
+            query_tokens.extend(a_tokens)
+        
+        if len(query_tokens) > self.max_query_length:
+            query_tokens = query_tokens[-self.max_query_length:]
+        
+        para_text = example.paragraph_text
+        para_tokens = self.tokenizer.tokenize(example.paragraph_text)
+        
+        char2token_index = []
+        token2char_start_index = []
+        token2char_end_index = []
+        char_idx = 0
+        for i, token in enumerate(para_tokens):
+            char_len = len(token)
+            char2token_index.extend([i] * char_len)
+            token2char_start_index.append(char_idx)
+            char_idx += char_len
+            token2char_end_index.append(char_idx - 1)
+        
+        tokenized_para_text = ''.join(para_tokens).replace('_', ' ')
+        
+        N, M = len(para_text), len(tokenized_para_text)
+        max_N, max_M = 1024, 1024
+        if N > max_N or M > max_M:
+            max_N = max(N, max_N)
+            max_M = max(M, max_M)
+        
+        match_mapping, mismatch = self._generate_match_mapping(para_text, tokenized_para_text, N, M, max_N, max_M)
+        
+        raw2tokenized_char_index = [None] * N
+        tokenized2raw_char_index = [None] * M
+        i, j = N-1, M-1
+        while i >= 0 and j >= 0:
+            if (i, j) not in match_mapping:
+                break
+            
+            if match_mapping[(i, j)] == 2:
+                raw2tokenized_char_index[i] = j
+                tokenized2raw_char_index[j] = i
+                i, j = i - 1, j - 1
+            elif match_mapping[(i, j)] == 1:
+                j = j - 1
+            else:
+                i = i - 1
+        
+        #if all(v is None for v in raw2tokenized_char_index) or mismatch:
+            #print('Mismatch') 
 
-        features.append(
-            CoqaFeatures(example_index=0,
-                         unique_id=0,
-                         doc_span_index=doc_span_index,
-                         tokens=tokens,
-                         token_to_orig_map=token_to_orig_map,
-                         token_is_max_context=token_is_max_context,
-                         input_ids=input_ids,
-                         input_mask=input_mask,
-                         segment_ids=segment_ids,
-                         start_position=start_position,
-                         end_position=end_position,
-                         cls_idx=slice_cls_idx,
-                         rational_mask=rational_mask))
-    return features
+        token2char_raw_start_index = []
+        token2char_raw_end_index = []
+        for idx in range(len(para_tokens)):
+            start_pos = token2char_start_index[idx]
+            end_pos = token2char_end_index[idx]
+            raw_start_pos = self._convert_tokenized_index(tokenized2raw_char_index, start_pos, N, is_start=True)
+            raw_end_pos = self._convert_tokenized_index(tokenized2raw_char_index, end_pos, N, is_start=False)
+            token2char_raw_start_index.append(raw_start_pos)
+            token2char_raw_end_index.append(raw_end_pos)
+        marks = list(zip(token2char_raw_start_index,token2char_raw_end_index))
+        raw_start,raw_end = example.r_start,example.r_end
+        if raw_start != None and raw_end !=None:
+            if raw_end >= marks[-1][1]:
+                raw_end = marks[-1][1]
+            if raw_start >= marks[-1][1]:
+                raw_start = -1
+            if raw_start != -1 and raw_end != -1:
+                r_start_tokenised = [i for i,j in enumerate(marks) if j[0] <= raw_start <= j[1]][0]
+                r_end_tokenised = [i for i,j in enumerate(marks) if j[0] <= raw_end <= j[1]][0]
+            else:
+                r_start_tokenised, r_end_tokenised = 0,0
+            assert r_start_tokenised <= r_end_tokenised
+        else:
+            r_start_tokenised, r_end_tokenised = None,None
+
+        if example.answer_type not in ["unknown", "yes", "no"] and not example.is_skipped and example.orig_answer_text:
+            raw_start_char_pos = example.start_position
+            raw_end_char_pos = raw_start_char_pos + len(example.orig_answer_text) - 1
+            tokenized_start_char_pos = self._convert_tokenized_index(raw2tokenized_char_index, raw_start_char_pos, is_start=True)
+            tokenized_end_char_pos = self._convert_tokenized_index(raw2tokenized_char_index, raw_end_char_pos, is_start=False)
+            tokenized_start_token_pos = char2token_index[tokenized_start_char_pos]
+            tokenized_end_token_pos = char2token_index[tokenized_end_char_pos]
+            assert tokenized_start_token_pos <= tokenized_end_token_pos
+        else:
+            tokenized_start_token_pos = tokenized_end_token_pos = -1
+        
+        # The -3 accounts for [CLS], [SEP] and [SEP]
+        max_para_length = self.max_seq_length - len(query_tokens) - 3
+        total_para_length = len(para_tokens)
+        
+        # We can have documents that are longer than the maximum sequence length.
+        # To deal with this we do a sliding window approach, where we take chunks
+        # of the up to our max length with a stride of `doc_stride`.
+        doc_spans = []
+        para_start = 0
+        while para_start < total_para_length:
+            para_length = total_para_length - para_start
+            if para_length > max_para_length:
+                para_length = max_para_length
+            
+            doc_spans.append({
+                "start": para_start,
+                "length": para_length
+            })
+            
+            if para_start + para_length == total_para_length:
+                break
+            
+            para_start += min(para_length, self.doc_stride)
+        
+        feature_list = []
+        for (doc_idx, doc_span) in enumerate(doc_spans):
+            input_tokens = []
+            segment_ids = []
+            p_mask = []
+            doc_token2char_raw_start_index = []
+            doc_token2char_raw_end_index = []
+            doc_token2doc_index = {}
+            
+            for i in range(doc_span["length"]):
+                token_idx = doc_span["start"] + i
+                
+                doc_token2char_raw_start_index.append(token2char_raw_start_index[token_idx])
+                doc_token2char_raw_end_index.append(token2char_raw_end_index[token_idx])
+                
+                best_doc_idx = self._find_max_context(doc_spans, token_idx)
+                doc_token2doc_index[len(input_tokens)] = (best_doc_idx == doc_idx)
+                
+                input_tokens.append(para_tokens[token_idx])
+                segment_ids.append(self.segment_vocab_map["<p>"])
+                p_mask.append(0)
+            
+            doc_para_length = len(input_tokens)
+            
+            input_tokens.append("<sep>")
+            segment_ids.append(self.segment_vocab_map["<p>"])
+            p_mask.append(1)
+            
+            # We put P before Q because during pretraining, B is always shorter than A
+            for query_token in query_tokens:
+                input_tokens.append(query_token)
+                segment_ids.append(self.segment_vocab_map["<q>"])
+                p_mask.append(1)
+
+            input_tokens.append("<sep>")
+            segment_ids.append(self.segment_vocab_map["<q>"])
+            p_mask.append(1)
+            
+            cls_index = len(input_tokens)
+            
+            input_tokens.append("<cls>")
+            segment_ids.append(self.segment_vocab_map["<cls>"])
+            p_mask.append(0)
+            
+            input_ids = self.tokenizer.tokens_to_ids(input_tokens)
+
+            # The mask has 0 for real tokens and 1 for padding tokens. Only real tokens are attended to.
+            input_mask = [0] * len(input_ids)
+            # Zero-pad up to the sequence length.
+            while len(input_ids) < self.max_seq_length:
+                input_ids.append(5) #pad
+                input_mask.append(1)
+                segment_ids.append(self.segment_vocab_map["<pad>"])
+                p_mask.append(1)
+            
+            assert len(input_ids) == self.max_seq_length
+            assert len(input_mask) == self.max_seq_length
+            assert len(segment_ids) == self.max_seq_length
+            assert len(p_mask) == self.max_seq_length
+            
+            start_position = None
+            end_position = None
+            is_unk = (example.answer_type == "unknown" or example.is_skipped)
+            is_yes = (example.answer_type == "yes")
+            is_no = (example.answer_type == "no")
+            doc_start = doc_span["start"]
+            doc_end = doc_start + doc_span["length"] - 1
+            if r_start_tokenised != None and r_end_tokenised !=None:
+                if r_start_tokenised >= doc_start and r_end_tokenised <= doc_end:
+                    r_start_tokenised = r_start_tokenised - doc_start
+                    r_end_tokenised = r_end_tokenised - doc_start
+            if example.answer_type == "number":
+                number_list = ["none", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten"]
+                number = number_list.index(example.answer_subtype) + 1
+            else:
+                number = 0
+            
+            if example.answer_type == "option":
+                option_list = ["option_a", "option_b"]
+                option = option_list.index(example.answer_subtype) + 1
+            else:
+                option = 0
+            
+            if example.answer_type not in ["unknown", "yes", "no"] and not example.is_skipped and example.orig_answer_text:
+                doc_start = doc_span["start"]
+                doc_end = doc_start + doc_span["length"] - 1
+                if tokenized_start_token_pos >= doc_start and tokenized_end_token_pos <= doc_end:
+                    start_position = tokenized_start_token_pos - doc_start
+                    end_position = tokenized_end_token_pos - doc_start
+                else:
+                    start_position = cls_index
+                    end_position = cls_index
+                    is_unk = True
+            else:
+                start_position = cls_index
+                end_position = cls_index
+            
+            feature = InputFeatures(
+                unique_id=self.unique_id,
+                qas_id=example.qas_id,
+                doc_idx=doc_idx,
+                token2char_raw_start_index=doc_token2char_raw_start_index,
+                token2char_raw_end_index=doc_token2char_raw_end_index,
+                token2doc_index=doc_token2doc_index,
+                input_tokens = input_tokens,
+                input_ids=input_ids,
+                input_mask=input_mask,
+                p_mask=p_mask,
+                segment_ids=segment_ids,
+                cls_index=cls_index,
+                para_length=doc_para_length,
+                r_start = r_start_tokenised,
+                r_end = r_end_tokenised,
+                start_position=start_position,
+                end_position=end_position,
+                is_unk=is_unk,
+                is_yes=is_yes,
+                is_no=is_no,
+                number=number,
+                option=option)
+            feature_list.append(feature)
+            self.unique_id += 1
+        
+        return feature_list
+    
+    def convert_examples_to_features(self, examples, is_training):
+        threads = cpu_count()
+        with Pool(threads) as p:
+            examp = list(tqdm(
+                p.imap(self.convert_coqa_example, examples), total=len(examples), desc="Extracting Features", ))
+
+        features = [item for sublist in examp for item in sublist]
+        for i in range(len(features)):
+            features[i].unique_id = 10000000+i 
+
+        all_input_ids = torch.tensor([f.input_ids for f in features], dtype=torch.long)
+        all_input_mask = torch.tensor([f.input_mask for f in features], dtype=torch.long)
+        all_segment_ids = torch.tensor([f.segment_ids for f in features], dtype=torch.long)
+        all_cls_idx = torch.tensor([f.cls_index for f in features], dtype=torch.long)
+        all_p_mask = torch.tensor([f.p_mask for f in features], dtype=torch.long)
+         
+        if not is_training:
+            all_example_index = torch.arange(all_input_ids.size(0), dtype=torch.long)
+            excR = all([f.r_start == None for f in features])
+            if not excR:
+                all_r_start = torch.tensor([f.r_start for f in features], dtype=torch.long)
+                all_r_end = torch.tensor([f.r_end for f in features], dtype=torch.long)
+                dataset = TensorDataset(all_input_ids, all_input_mask, all_segment_ids, all_cls_idx, all_p_mask, all_example_index,all_r_start, all_r_end)
+            else:
+                dataset = TensorDataset(all_input_ids, all_input_mask, all_segment_ids, all_cls_idx, all_p_mask, all_example_index)
+        else:
+            all_start_positions = torch.tensor([f.start_position for f in features], dtype=torch.long)
+            all_end_positions = torch.tensor([f.end_position for f in features], dtype=torch.long)
+            all_unk = torch.tensor([f.is_unk for f in features], dtype=torch.long)
+            all_yes = torch.tensor([f.is_yes for f in features], dtype=torch.long)
+            all_no = torch.tensor([f.is_no for f in features], dtype=torch.long)
+            all_number = torch.tensor([f.number for f in features], dtype=torch.long)
+            all_option = torch.tensor([f.option for f in features], dtype=torch.long)
+            dataset = TensorDataset(all_input_ids, all_input_mask, all_segment_ids, all_p_mask, all_cls_idx,
+                    all_start_positions, all_end_positions, all_unk, all_yes, all_no, all_number, all_option)
+
+        return features, dataset
+
+class XLNetPredictProcessor(object):
+    def __init__(self, output_dir, tokenizer, n_best_size = 5, start_n_top = 5, end_n_top = 5, max_answer_length = 16,  predict_tag=None):
+        self.n_best_size = n_best_size
+        self.start_n_top = start_n_top
+        self.end_n_top = end_n_top
+        self.max_answer_length = max_answer_length
+        self.tokenizer = tokenizer
+        
+        predict_tag = predict_tag if predict_tag else "normal"
+        self.output_summary = os.path.join(output_dir, "predict_{0}_sum.json".format(predict_tag))
+        self.output_detail = os.path.join(output_dir, "predict_{0}_det.json".format(predict_tag))
+    
+    def _write_to_json(self, data_list, data_path):
+        data_folder = os.path.dirname(data_path)
+        if not os.path.exists(data_folder):
+            os.mkdir(data_folder)
+
+        with open(data_path, "w") as file:  
+            json.dump(data_list, file, indent=4)
+   
+    def process(self, examples, features, results):
+        qas_id_to_features = {}
+        unique_id_to_feature = {}
+        for feature in features:
+            if feature.qas_id not in qas_id_to_features:
+                qas_id_to_features[feature.qas_id] = []
+            
+            qas_id_to_features[feature.qas_id].append(feature)
+            unique_id_to_feature[feature.unique_id] = feature
+        
+        unique_id_to_result = {}
+        for result in results:
+            unique_id_to_result[result.unique_id] = result
+        
+        predict_summary_list = []
+        predict_detail_list = []
+        num_example = len(examples)
+        for (example_idx, example) in enumerate(examples):
+            if example_idx % 1000 == 0:
+                print('Updating {0}/{1} example with predict'.format(example_idx, num_example))
+            
+            if example.qas_id not in qas_id_to_features:
+                print('No feature found for example: {0}'.format(example.qas_id))
+                continue
+            
+            example_unk_score = MAX_FLOAT
+            example_yes_score = MIN_FLOAT
+            example_no_score = MIN_FLOAT
+            example_num_id = 0
+            example_num_score = MIN_FLOAT
+            example_num_probs = None
+            example_opt_id = 0
+            example_opt_score = MIN_FLOAT
+            example_opt_probs = None
+            
+            example_all_predicts = []
+            example_features = qas_id_to_features[example.qas_id]
+            for example_feature in example_features:
+                if example_feature.unique_id not in unique_id_to_result:
+                    print('No result found for feature: {0}'.format(example_feature.unique_id))
+                    continue
+                
+                example_result = unique_id_to_result[example_feature.unique_id]
+                example_unk_score = min(example_unk_score, float(example_result.unk_prob))
+                example_yes_score = max(example_yes_score, float(example_result.yes_prob))
+                example_no_score = max(example_no_score, float(example_result.no_prob))
+                
+                num_probs = [float(num_prob) for num_prob in example_result.num_probs]
+                num_id = int(np.argmax(num_probs[1:])) + 1
+                num_score = num_probs[num_id]
+                if example_num_score < num_score:
+                    example_num_id = num_id
+                    example_num_score = num_score
+                    example_num_probs = num_probs
+                
+                opt_probs = [float(opt_prob) for opt_prob in example_result.opt_probs]
+                opt_id = int(np.argmax(opt_probs[1:])) + 1
+                opt_score = opt_probs[opt_id]
+                if example_opt_score < opt_score:
+                    example_opt_id = opt_id
+                    example_opt_score = opt_score
+                    example_opt_probs = opt_probs
+                
+                for i in range(self.start_n_top):
+                    start_prob = example_result.start_prob[i]
+                    start_index = example_result.start_index[i]
+                    
+                    for j in range(self.end_n_top):
+                        end_prob = example_result.end_prob[i][j]
+                        end_index = example_result.end_index[i][j]
+                        
+                        answer_length = end_index - start_index + 1
+                        if end_index < start_index or answer_length > self.max_answer_length:
+                            continue
+                        
+                        if start_index > example_feature.para_length or end_index > example_feature.para_length:
+                            continue
+                        
+                        if start_index not in example_feature.token2doc_index:
+                            continue
+                        
+                        example_all_predicts.append({
+                            "unique_id": example_result.unique_id,
+                            "start_prob": float(start_prob),
+                            "start_index": int(start_index),
+                            "end_prob": float(end_prob),
+                            "end_index": int(end_index),
+                            "predict_score": float(np.log(start_prob) + np.log(end_prob))
+                        })
+            
+            example_all_predicts = sorted(example_all_predicts, key=lambda x: x["predict_score"], reverse=True)
+            
+            is_visited = set()
+            example_top_predicts = []
+            for example_predict in example_all_predicts:
+                if len(example_top_predicts) >= self.n_best_size:
+                    break
+                
+                example_feature = unique_id_to_feature[example_predict["unique_id"]]
+                predict_start = example_feature.token2char_raw_start_index[example_predict["start_index"]]
+                if example_predict["end_index"] >= len(example_feature.token2char_raw_end_index):
+                    example_predict["end_index"] = len(example_feature.token2char_raw_end_index)-1
+                predict_end = example_feature.token2char_raw_end_index[example_predict["end_index"]]
+                predict_text = example.paragraph_text[predict_start:predict_end + 1].strip()
+                
+                if predict_text in is_visited:
+                    continue
+                
+                is_visited.add(predict_text)
+                
+                example_top_predicts.append({
+                    "predict_text": predict_text,
+                    "predict_score": example_predict["predict_score"]
+                })
+            
+            if len(example_top_predicts) == 0:
+                example_top_predicts.append({
+                    "predict_text": "",
+                    "predict_score": 0.0
+                })
+            
+            example_best_predict = example_top_predicts[0]
+            
+            example_question_text = example.question_text.split('<s>')[-1].strip()
+            
+            predict_summary_list.append({
+                "qas_id": example.qas_id,
+                "question_text": example_question_text,
+                "label_text": example.orig_answer_text,
+                "unk_score": example_unk_score,
+                "yes_score": example_yes_score,
+                "no_score": example_no_score,
+                "num_id": example_num_id,
+                "num_score": example_num_score,
+                "num_probs": example_num_probs,
+                "opt_id": example_opt_id,
+                "opt_score": example_opt_score,
+                "opt_probs": example_opt_probs,
+                "predict_text": example_best_predict["predict_text"],
+                "predict_score": example_best_predict["predict_score"]
+            })
+                                          
+            predict_detail_list.append({
+                "qas_id": example.qas_id,
+                "question_text": example_question_text,
+                "label_text": example.orig_answer_text,
+                "unk_score": example_unk_score,
+                "yes_score": example_yes_score,
+                "no_score": example_no_score,
+                "num_id": example_num_id,
+                "num_score": example_num_score,
+                "num_probs": example_num_probs,
+                "opt_id": example_opt_id,
+                "opt_score": example_opt_score,
+                "opt_probs": example_opt_probs,
+                "best_predict": example_best_predict,
+                "top_predicts": example_top_predicts
+            })
+        
+        self._write_to_json(predict_summary_list, self.output_summary)
+        self._write_to_json(predict_detail_list, self.output_detail)
 
 
-def Extract_Features(examples, tokenizer, max_seq_length, doc_stride, max_query_length, is_training,threads=1):
-    features = []
-    threads = min(threads, cpu_count())
-    with Pool(threads, initializer=Extract_Feature_init, initargs=(tokenizer,)) as p:
-        annotate_ = partial(
-            Extract_Feature,
-            tokenizer=tokenizer,
-            max_seq_length=max_seq_length,
-            doc_stride=doc_stride,
-            max_query_length=max_query_length,
-        )
-        features = list(
-            tqdm(
-                p.imap(annotate_, examples, chunksize=16),
-                total=len(examples),
-                desc="Extracting features from dataset",
-            )
-        )
-
-    new_features = []
-    unique_id = 1000000000
-    example_index = 0
-    for example_features in tqdm(features, total=len(features), desc="Tag unique id to each example"):
-        if not example_features:
-            continue
-        for example_feature in example_features:
-            example_feature.example_index = example_index
-            example_feature.unique_id = unique_id
-            new_features.append(example_feature)
-            unique_id += 1
-        example_index += 1
-    features = new_features
-    del new_features
-    all_input_ids = torch.tensor([f.input_ids for f in features], dtype=torch.long)
-    all_input_mask = torch.tensor([f.input_mask for f in features], dtype=torch.long)
-    all_tokentype_ids = torch.tensor([f.segment_ids for f in features], dtype=torch.long)
-    if not is_training:
-        all_example_index = torch.arange(all_input_ids.size(0), dtype=torch.long)
-        dataset = TensorDataset(all_input_ids, all_tokentype_ids, all_input_mask, all_example_index)
-    else:
-        all_start_positions = torch.tensor([f.start_position for f in features], dtype=torch.long)
-        all_end_positions = torch.tensor([f.end_position for f in features], dtype=torch.long)
-        all_rational_mask = torch.tensor([f.rational_mask for f in features], dtype=torch.long)
-        all_cls_idx = torch.tensor([f.cls_idx for f in features], dtype=torch.long)
-        dataset = TensorDataset(all_input_ids, all_tokentype_ids, all_input_mask, all_start_positions,
-                                all_end_positions, all_rational_mask, all_cls_idx)
-
-    return features, dataset

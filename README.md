@@ -16,14 +16,16 @@ python main.py --train [O|C] --eval [O|TS|RG] --output [directory]
 e.g.
 
 ```
-python main.py --train O --eval O --output Roberta_orig 	#(original training and eval on O)
-python main.py --eval TS --output Roberta_orig 			#(evaluate the model at Roberta_orig on TS dataset)
-python main.py --train C --eval O --output Roberta_orig 	#(combined training and eval on O)
+python main.py --train O --eval O --output XLNet_orig 	#(original training and eval on O)
+python main.py --eval TS --output XLNet_orig 		#(evaluate the model at XLNet_orig on TS dataset)
+python main.py --train C --eval O --output XLNet_orig 	#(combined training and eval on O)
 ```
 
-3) Following eval you will have a predictions.json file at the provided directory. Then run
+3) Following eval you will have a predict_normal_det.json file at the provided directory. Then run
+
 ```
-python evaluate-v1.0.py --data-file data/coqa-dev-v1.0.json --pred-file [directory]/predictions.json
+python ./results/convert_coqa.py --input_file ./[directory]/predict_normal_det.json --output_file pred.json
+python evaluate-v1.0.py --data-file data/coqa-dev-v1.0.json --pred-file pred.json
 ```
 
 4) Steps 2, 3 needs to be repeated for original and combined training and evaluation on all datasets.
